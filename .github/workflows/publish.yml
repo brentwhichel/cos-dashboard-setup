@@ -1,0 +1,143 @@
+name: Publish setup page
+
+on:
+  issues:
+    types: [opened, edited]
+  push:
+    branches: [main]
+    paths: ['docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publish-setup-page
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.actor == github.repository_owner) ||
+      (github.event_name == 'issues' &&
+       github.actor == github.repository_owner &&
+       github.event.issue.title == 'Publish channel (automated)' &&
+       contains(github.event.issue.body, 'cos-payload-v1'))
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 10
+
+      - name: Unpack the update from the publishing issue
+        id: unpack
+        if: github.event_name == 'issues'
+        shell: python
+        run: |
+          import base64, hashlib, json, lzma, os, re, shutil, time
+          ev = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8"))
+          body = ev["issue"]["body"] or ""
+          m = re.search(r"cos-payload-v1\s+id=(\w{6,40})\s+part=(\d+)/(\d+)\s+sha=(\w{16})\s+([A-Za-z0-9+/=\s]+?)\s*cos-end", body)
+          if not m:
+              raise SystemExit("No payload found in the issue body")
+          pid, i, n, sha = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+          if not 1 <= i <= n <= 20:
+              raise SystemExit("Bad part number")
+          stage = os.path.join(".publish", pid)
+          os.makedirs(stage, exist_ok=True)
+          with open(os.path.join(stage, "%02d" % i), "w") as f:
+              f.write("".join(m.group(5).split()))
+          tmp = os.environ["RUNNER_TEMP"]
+          now = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime())
+          def note(name, text):
+              with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                  f.write(text)
+          parts = [os.path.join(stage, "%02d" % k) for k in range(1, n + 1)]
+          if not all(os.path.exists(p) for p in parts):
+              got = sum(os.path.exists(p) for p in parts)
+              note("message.txt", "Publish channel: part %d of %d (%s)" % (i, n, pid))
+              note("receipt.txt", "Received part %d of %d (%d of %d so far) of update %s at %s; waiting for the rest." % (i, n, got, n, pid, now))
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("complete=false\n")
+              raise SystemExit(0)
+          data = "".join(open(p).read() for p in parts)
+          if hashlib.sha256(data.encode()).hexdigest()[:16] != sha:
+              raise SystemExit("The parts don't match; send the whole update again")
+          upd = json.loads(lzma.decompress(base64.b64decode(data)))
+          for path, text in upd["files"].items():
+              if ".." in path or not re.fullmatch(r"docs/[A-Za-z0-9_.-][A-Za-z0-9_./-]*|README\.md", path):
+                  raise SystemExit("Refusing to write " + path)
+              if os.path.dirname(path):
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8", newline="") as f:
+                  f.write(text)
+          shutil.rmtree(".publish")
+          as_of = str(upd.get("as_of", ""))
+          note("message.txt", "Setup page update " + as_of)
+          note("receipt.txt", "Published " + as_of + " at " + now + ".")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("complete=true\n")
+
+      - name: Commit the update
+        if: github.event_name == 'issues'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing changed"
+          else
+            git commit -m "$(cat "$RUNNER_TEMP/message.txt")"
+            git push
+          fi
+
+      - name: Clear any unfinished Pages deployment
+        if: steps.unpack.outputs.complete != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          for sha in $(git rev-list --max-count=10 HEAD); do
+            if [ "$sha" = "$HEAD_SHA" ] || [ "$sha" = "$GITHUB_SHA" ]; then continue; fi
+            st=$(gh api "repos/$GITHUB_REPOSITORY/pages/deployments/$sha" --jq .status 2>/dev/null || true)
+            case "$st" in
+              deployment_queued|deployment_in_progress|syncing_files|finished_file_sync|updating_pages|purging_cdn|pending|queued|in_progress)
+                gh api -X POST "repos/$GITHUB_REPOSITORY/pages/deployments/$sha/cancel" >/dev/null 2>&1 && echo "Cancelled an unfinished deployment for $sha ($st)" || true ;;
+            esac
+          done
+
+      - uses: actions/configure-pages@v5
+        if: steps.unpack.outputs.complete != 'false'
+
+      - uses: actions/upload-pages-artifact@v4
+        if: steps.unpack.outputs.complete != 'false'
+        with:
+          path: docs
+
+      - id: deploy
+        if: steps.unpack.outputs.complete != 'false'
+        uses: actions/deploy-pages@v4
+
+      - name: Leave a receipt on the issue
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUM: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$NUM" --repo "$GITHUB_REPOSITORY" --body "$(cat "$RUNNER_TEMP/receipt.txt") Commit $(git rev-parse --short HEAD). This issue is the publishing channel for the setup page."
+
+      - name: Record a failure on the issue
+        if: failure() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUM: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$NUM" --repo "$GITHUB_REPOSITORY" --body "FAILED to publish at $(date -u +%Y-%m-%dT%H:%MZ). Details: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
